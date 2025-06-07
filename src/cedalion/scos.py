@@ -130,7 +130,7 @@ def compute_sensitivity_scos(
     # 5 = wm
     """
     # Get the measurement list from the foward model object
-    meas_list = rec.measurement_list()
+    meas_list = rec._measurement_lists['hrf_conc']
 
     T_exp = np.float64(T_exp)
 
@@ -182,6 +182,7 @@ def compute_sensitivity_scos(
 
     # Define the number of elements needed for various preallocation
     num_voxels = np.max(np.shape(data_DCS_all[key]))
+    num_channels = len(meas_list.source)/2
     num_channels = int(num_channels)
     num_voxels = int(num_voxels)
     num_vertices = fwm.head_model.voxel_to_vertex_brain.shape[1]
@@ -208,9 +209,9 @@ def compute_sensitivity_scos(
         for tau in range(len(tau_to_integrate)):  # tau time shift
             keyO = f'data_optode_tau{int(tau)}'
             keyA = f'data_all_tau{int(tau)}'
-            ALLs[:,tau] = data_DCS_all[keyA].sel(label = source, wavelength = 830).values     # source corr fluence   v byt tau
-            ALLd[:,tau] = data_DCS_all[keyA].sel(label = detector, wavelength = 830).values   # detector corr fluence  v by tau
-            OPTODE[tau] = data_DCS_optode[keyO].sel(optode1 = source, optode2 = detector, wavelength = 830).values # channel corr fluence 1d tau
+            ALLs[:,tau] = data_DCS_all[keyA].sel(label = source, wavelength = 'nan').values     # source corr fluence   v byt tau
+            ALLd[:,tau] = data_DCS_all[keyA].sel(label = detector, wavelength = 'nan').values   # detector corr fluence  v by tau
+            OPTODE[tau] = data_DCS_optode[keyO].sel(optode1 = source, optode2 = detector, wavelength = 'nan').values # channel corr fluence 1d tau
 
         # Calculate the perturbation term
         phi = (-(np.divide(C*(np.matlib.repmat(tau_to_integrate,num_voxels,1)*ALLd*ALLs ),np.matlib.repmat(OPTODE,num_voxels,1))).T @ fwm.head_model.voxel_to_vertex_brain).T
@@ -242,4 +243,4 @@ def compute_sensitivity_scos(
         with open(f'{date_time_str}_sensitivity_matrix_rytov_xr.pickle', 'wb') as f:
             pickle.dump(A_xr, f)
 
-        return A
+        return A_xr
