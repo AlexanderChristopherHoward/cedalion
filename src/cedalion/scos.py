@@ -4,7 +4,7 @@ import xarray as xr
 
 
 def test():
-    print('this worked')
+    print('This worked!\nCongradulations!\nYou have successfully loaded the SCOS fork.\nYou now have access to scos.py')
     return
 
 def compute_autocorrelation_mcx(
@@ -130,7 +130,7 @@ def compute_sensitivity_scos(
     # 5 = wm
     """
     # Get the measurement list from the foward model object
-    meas_list = fwm.measurement_list()
+    meas_list = rec.measurement_list()
 
     T_exp = np.float64(T_exp)
 
