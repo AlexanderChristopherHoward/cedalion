@@ -230,17 +230,17 @@ def compute_sensitivity_scos(
         numerator =      np.trapz(  np.abs(np.divide(G10sd,np.transpose(np.matlib.repmat(G10sd[:,0],len(tau_to_integrate),1))))**2*np.matlib.repmat((1-tau_to_integrate/T_exp),num_vertices,1)  , np.matlib.repmat(tau_to_integrate,num_vertices,1), axis=1)  # original 
         A[i,:] = (np.divide(numerator,denominator)-1)/dDb
 
-        # Put A into an xarray
-        A_xr = xr.DataArray(
-            A[::3,:,np.newaxis],
-            dims=["channel", "vertex", 'wavelength'],
-            coords={
-                "channel": ("channel", rec['hrf_conc'].channel.values),
-                "wavelength": ("wavelength", [830]),
-                "is_brain": ("vertex", np.ones(num_vertices)),
-            })
+    # Put A into an xarray
+    A_xr = xr.DataArray(
+        A[::3,:,np.newaxis],
+        dims=["channel", "vertex", 'wavelength'],
+        coords={
+            "channel": ("channel", rec['hrf_conc'].channel.values),
+            "wavelength": ("wavelength", [830]),
+            "is_brain": ("vertex", np.ones(num_vertices)),
+        })
 
-        with open(f'{date_time_str}_sensitivity_matrix_rytov_xr.pickle', 'wb') as f:
-            pickle.dump(A_xr, f)
+    with open(f'{date_time_str}_sensitivity_matrix_rytov_xr.pickle', 'wb') as f:
+        pickle.dump(A_xr, f)
 
-        return A_xr
+    return A_xr
