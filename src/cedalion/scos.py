@@ -24,7 +24,7 @@ def compute_autocorrelation_mcx(
         aDb: Numpy array containing values for the weighted diffusion coefficient of the brain (mm^2/s) defined for each tissue type. Values from (lin2023).
         wavelength: Wavelength of light in mm.
         n: refractive index used for the head model.
-        T_exp: Exposure time of the cameras.
+        T_exp: Exposure time of the cameras in seconds.
         NUM_TAU: The number of non-zero decorrelation times used for the simulation.
     
     Returns: 
