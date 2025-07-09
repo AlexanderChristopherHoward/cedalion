@@ -1,1 +1,0 @@
-from cedalion.sigdecomp.multimodal.mspoc import mSPoC, temporal_embedding, get_orthonormal_matrix

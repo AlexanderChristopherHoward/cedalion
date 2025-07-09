@@ -1,5 +1,3 @@
-"""Utility functions for image reconstruction."""
-
 import xarray as xr
 import numpy as np
 import cedalion

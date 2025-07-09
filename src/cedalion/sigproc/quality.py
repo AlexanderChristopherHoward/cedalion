@@ -1,16 +1,14 @@
 """Signal quality metrics and channel pruning functionality."""
 
-from __future__ import annotations
 import logging
 from functools import reduce
+from typing import Annotated
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 from numpy.typing import ArrayLike
 from scipy import signal
-from scipy.stats import gaussian_kde
-from scipy.stats import median_abs_deviation
 
 import cedalion.dataclasses as cdc
 import cedalion.typing as cdt
@@ -28,10 +26,7 @@ TAINTED = False
 
 @cdc.validate_schemas
 def prune_ch(
-    amplitudes: cdt.NDTimeSeries,
-    masks: list[cdt.NDTimeSeries],
-    operator: str,
-    flag_drop: bool = True,
+    amplitudes: cdt.NDTimeSeries, masks: list[cdt.NDTimeSeries], operator: str, flag_drop: bool = True
 ):
     """Prune channels from the the input data array using quality masks.
 
@@ -87,13 +82,127 @@ def prune_ch(
     return amplitudes, prune_list
 
 
+# fails in unit test
+# PSP > threshold is CLEAN
+@cdc.validate_schemas
+def _psp_alternative(
+    amplitudes: NDTimeSeries,
+    window_length: Annotated[Quantity, "[time]"],
+    psp_thresh: float,
+    cardiac_fmin: Annotated[Quantity, "[frequency]"] = 0.5 * units.Hz,
+    cardiac_fmax: Annotated[Quantity, "[frequency]"] = 2.5 * units.Hz,
+):
+    """Calculate the peak spectral power.
+
+    The peak spectral power metric is based on :cite:t:`Pollonini2014` /
+    :cite:t:`Pollonini2016`.
+
+    Args:
+        amplitudes (:class:`NDTimeSeries`, (channel, wavelength, time)): input time
+            series
+        window_length (:class:`Quantity`, [time]): size of the computation window
+        psp_thresh: if the calculated PSP metric falls below this threshold then the
+            corresponding time window should be excluded.
+        cardiac_fmin : minimm frequency to extract cardiac component
+        cardiac_fmax : maximum frequency to extract cardiac component
+
+    Returns:
+        A tuple (psp, psp_mask), where psp is a DataArray with coords from the input
+        NDTimeseries containing the peak spectral power. psp_mask is a boolean mask
+        DataArray with coords from psp, true where psp_thresh is met.
+    """
+    amp = _extract_cardiac(amplitudes, cardiac_fmin, cardiac_fmax)
+
+    amp = (amp - amp.mean("time")) / amp.std("time")
+
+    # convert window_length to samples
+    nsamples = (window_length * sampling_rate(amp)).to_base_units()
+    nsamples = int(np.floor(nsamples))
+
+    # This creates a new DataArray with a new dimension "window", that is
+    # window_len_samples large. The time dimension will contain the time coordinate of
+    # the first sample in the window. Setting the stride size to the same value as the
+    # window length will result in non-overlapping windows.
+    num_windows = int(np.floor(amp.sizes['time'] / nsamples))
+
+    # Manually create windows
+    windowed_data = []
+    for i in range(num_windows):
+        start = i * nsamples
+        end = start + nsamples
+        windowed_data.append(amp.isel(time=slice(start, end)))
+
+
+    fs = amp.cd.sampling_rate
+
+    psp = np.zeros([len(amp["channel"]), len(windowed_data)])
+
+    # Vectorized signal extraction and correlation
+    # sig = windows.transpose("channel", "time", "wavelength", "window").values
+    lags = np.arange(-nsamples + 1, nsamples)
+
+    for w,sig_temp in enumerate(windowed_data): # loop over windows
+        # sig_temp = sig[:,w,:,:]
+        # FIXME assumes 2 wavelengths
+        corr = np.array(
+            [
+                signal.correlate(sig_temp[ch, 0, :], sig_temp[ch, 1, :], "full")
+                for ch in range(len(amp['channel']))
+            ]
+        )
+
+        # FIXME assumes 2 wavelengths
+        corr = corr /(nsamples - np.abs(lags))
+        corr_len = corr.shape[1]
+
+        # Update similarity
+        corr_norm = np.array(
+            [
+                (corr_len * corr[ch,:]) / np.sqrt(np.sum(np.abs(sig_temp[ch, 0, :]) ** 2) * np.sum(np.abs(sig_temp[ch, 1, :]) ** 2)).values
+                for ch in range(len(amp['channel']))
+                ]
+            )
+        
+        
+        # nperseg = corr.shape[1]
+        # window = np.hamming(nperseg)
+        # window_seg = corr * window
+        
+        # fft_out = np.fft.rfft(window_seg, axis=1)
+        # psd = (np.abs(fft_out) **2)/ (np.sum(window ** 2))
+        # freqs = np.fft.rfftfreq(nperseg, 1/fs)
+
+        for ch in range(len(amp['channel'])):
+            window = signal.windows.hamming(len(corr[ch,:]))
+            f, pxx = signal.welch(
+                corr_norm[ch, :],
+                window=window,
+                nfft=len(corr_norm[ch, :]),
+                fs=fs,
+                scaling="spectrum",
+            )
+
+            psp[ch, w] = np.max(pxx[f<cardiac_fmax.magnitude])
+
+    # keep dims channel and time
+    window_length = nsamples/fs
+    window_times = np.arange(0, num_windows*window_length, window_length)
+    psp_xr = xr.DataArray(psp, dims=["channel", "time"], coords={"channel" : amp.channel.values, "time" : window_times})
+    
+    # Apply threshold mask
+    psp_mask = xrutils.mask(psp_xr, CLEAN)
+    psp_mask = psp_mask.where(psp_xr > psp_thresh, other=TAINTED)
+
+    return psp_xr, psp_mask
+
+# alternative implementation
 @cdc.validate_schemas
 def psp(
     amplitudes: NDTimeSeries,
-    window_length: cdt.QTime,
+    window_length: Annotated[Quantity, "[time]"],
     psp_thresh: float,
-    cardiac_fmin: cdt.QFrequency = 0.5 * units.Hz,
-    cardiac_fmax: cdt.QFrequency = 2.5 * units.Hz,
+    cardiac_fmin: Annotated[Quantity, "[frequency]"] = 0.5 * units.Hz,
+    cardiac_fmax: Annotated[Quantity, "[frequency]"] = 2.5 * units.Hz,
 ):
     """Calculate the peak spectral power.
 
@@ -135,20 +244,20 @@ def psp(
     # Vectorized signal extraction and correlation
     sig = windows.transpose("channel", "time", "wavelength", "window").values
     nchannel = windows.sizes["channel"]
-    ntime = windows.sizes["time"]  # after rolling this is the number of windows
+    ntime = windows.sizes["time"] # after rolling this is the number of windows
 
     lags = np.arange(-nsamples + 1, nsamples)
     nlags = len(lags)
-    norm_unbiased = nsamples - np.abs(lags)  # shape (nlags,)
+    norm_unbiased = (nsamples - np.abs(lags)) # shape (nlags,)
 
     hamming_window = np.hamming(nlags)
     hamming_window_norm = np.sum(hamming_window) ** 2
 
     # nsample / (sigma(wl1)*sigma(wl2)) , shape(nchannel, ntime)
-    corr_coeff_denom = nsamples / np.sqrt(np.sum(np.power(sig, 2), axis=-1)).prod(-1)
+    corr_coeff_denom = nsamples / np.sqrt(np.sum(np.power(sig, 2), axis=-1)).prod(-1) 
 
     corr = np.zeros((ntime, nchannel, nlags))
-    for w in range(ntime):  # loop over windows
+    for w in range(ntime): # loop over windows
         for ch in range(nchannel):
             corr[w, ch, :] = signal.correlate(
                 sig[ch, w, 0, :], sig[ch, w, 1, :], "full"
@@ -159,10 +268,10 @@ def psp(
     corr /= norm_unbiased[None, None, :]
     corr *= hamming_window[None, None, :]
 
-    fft_out = np.fft.rfft(corr, axis=-1)  # shape (ntime, nchannel, nfreqs)
+    fft_out = np.fft.rfft(corr, axis=-1) # shape (ntime, nchannel, nfreqs)
     power = (np.abs(fft_out) ** 2) / hamming_window_norm
 
-    psp = np.max(power, axis=2).T  # shape(nchannel, ntime)
+    psp = np.max(power, axis=2).T # shape(nchannel, ntime)
 
     # keep dims channel and time
     psp_xr = windows.isel(wavelength=0, window=0).drop_vars("wavelength").copy(data=psp)
@@ -174,20 +283,17 @@ def psp(
     return psp_xr, psp_mask
 
 
+
+
+
+
 @cdc.validate_schemas
-def gvtd(amplitudes: NDTimeSeries, stat_type: str = "default", n_std: int = 10):
-    """Calculate GVTD metric based on :cite:t:`Sherafati2020`.
+def gvtd(amplitudes: NDTimeSeries):
+    """Calculate GVTD metric.
 
     Args:
         amplitudes (:class:`NDTimeSeries`, (channel, wavelength, time)): input time
             series
-
-        stat_type (string): statistic of GVTD time trace to use to set the threshold
-            (see _get_gvtd_threshold). Default = 'default'
-
-        n_std (int): number of standard deviations for consider above the statistic of
-            interest.
-
     Returns:
         A DataArray with coords from the input NDTimeseries containing the GVTD metric.
     """
@@ -201,8 +307,6 @@ def gvtd(amplitudes: NDTimeSeries, stat_type: str = "default", n_std: int = 10):
     od.time.attrs["units"] = units.s
     od_filtered = od.cd.freq_filter(fcut_min, fcut_max, 4)
 
-    od_filtered = od_filtered.pint.dequantify() # OD is dimensionless
-
     # Step 1: Find the matrix of the temporal derivatives
     dataDiff = od_filtered - od_filtered.shift(time=-1)
 
@@ -213,244 +317,16 @@ def gvtd(amplitudes: NDTimeSeries, stat_type: str = "default", n_std: int = 10):
     # time-points as your original dataMatrix
     GVTD = GVTD.squeeze()
     GVTD.values = np.hstack([0, GVTD.values[:-1]])
-    GVTD = GVTD.drop_vars("wavelength")
 
-    # Step 4: Scale to have units of OD/s
-    GVTD *= freq.sampling_rate(amplitudes)
-
-    # Apply threshold mask
-    thresh = _get_gvtd_threshold(GVTD, stat_type=stat_type, n_std=n_std)
-
-    GVTD_mask = xrutils.mask(GVTD, CLEAN)
-    GVTD_mask = GVTD_mask.where(GVTD < thresh, other=TAINTED)
-
-    return GVTD, GVTD_mask
-
-
-def _get_gvtd_threshold(
-    GVTD: NDTimeSeries,
-    stat_type: str = "default",
-    n_std: int = 10,
-):
-    """Calculate GVTD threshold based on :cite:t:`Sherafati2020`.
-
-    Args:
-        GVTD (:class:`NDTimeSeries`, (time,)): GVTD timetrace
-
-        stat_type (string): statistic of GVTD time trace to use to set the threshold
-
-            - *default*: threshold is the mode plus the distance between the smallest
-              GVTD value and the mode.
-            - *histogram_mode*: threshold is the mode plus the standard deviation of the
-              points below the mode * n_std.
-            - *kdensity_mode*: use kdensity estimation to find the mode the gvtd
-              distribution. threshold is this mode pluts the standard deviation of
-              points below the mode * n_std.
-            - *parabolic_mode*: use parabolic interpolation to estimate the mode.
-              threshold is this mode pluts the standard deviation of points below the
-              mode*n_std.
-            - *mean*: same as histogram_mode but using the mean instead of the mode.
-            - *median*: same as histogram_mode but using the median instead of the mode.
-            - *MAD*: same as histogram_mode but using the MAD instead of the mode.
-
-        n_std (int): number of standard deviations for consider above the statistic of
-            interest.
-
-    Returns:
-        thresh (float): the threshold above which GVTD is considered motion.
-    """
-
-    units = GVTD.pint.units
-    GVTD = GVTD.pint.dequantify()
-
-    if stat_type == "default":
-        min_counts_per_bin = 5
-
-        n_bins = int(np.round(GVTD.shape[0] / min_counts_per_bin))
-
-        bin_size = GVTD.max() / n_bins
-
-        N, edges = np.histogram(
-            GVTD.values, bins=n_bins, range=(0, np.max(GVTD.values))
-        )
-
-        argmax = np.argmax(N)
-
-        run_mode = edges[argmax] + bin_size / 2
-
-        # To find the motion threshold, the distance between the smallest GVTD value and
-        # the mode is calculated left tail is used, as it is dominated by the
-        # physiological signal and not motion artifacts.
-        min_val_to_mode_dist = run_mode - np.min(GVTD)
-
-        # Motion threshold is defined as mode plus a multiplier of the standard
-        # deviation of the data-points below the mode
-        thresh = run_mode + min_val_to_mode_dist
-
-    elif stat_type == "histogram_mode":
-        min_counts_per_bin = 5
-
-        n_bins = int(np.round(GVTD.shape[0] / min_counts_per_bin))
-
-        bin_size = GVTD.max() / n_bins
-
-        N, edges = np.histogram(
-            GVTD.values, bins=n_bins, range=(0, np.max(GVTD.values))
-        )
-
-        argmax = np.argmax(N)
-
-        run_mode = edges[argmax] + bin_size / 2
-
-        # Find time points below the mode
-        points_below_mode = GVTD[GVTD < run_mode]
-
-        # Number of points below the mode
-        num_points_below_mode = points_below_mode.size
-
-        # RMS of points below the mode
-        rms_points_below_mode = np.sum((points_below_mode - run_mode) ** 2)
-
-        # Standard deviation of points below the mode
-        left_std_run = np.sqrt(rms_points_below_mode / num_points_below_mode)
-
-        # Motion threshold is defined as mode plus a multiplier of the standard
-        # deviation of the data-points below the mode
-        thresh = run_mode + n_std * left_std_run
-
-    elif stat_type == "kdensity_mode":
-        # consider only gvtd values that are finite and positive
-        mask = np.isfinite(GVTD) & (GVTD > 0)
-        gvtd_log = np.log(GVTD[mask].values)
-
-        # Kernel density estimate for the log of gvtdTimeTrace
-        kde = gaussian_kde(gvtd_log)
-        xi = np.linspace(np.min(gvtd_log), np.max(gvtd_log), 1000)
-        f = kde(xi)
-
-        # Find the mode (the point with maximum density)
-        idx = np.argmax(f)
-        run_mode = np.exp(xi[idx])
-
-        # Find time points below the mode
-        points_below_mode = GVTD[GVTD < run_mode]
-
-        # Number of points below the mode
-        num_points_below_mode = points_below_mode.size
-
-        # RMS of points below the mode
-        rms_points_below_mode = np.sum((points_below_mode - run_mode) ** 2)
-
-        # Standard deviation of points below the mode
-        left_std_run = np.sqrt(rms_points_below_mode / num_points_below_mode)
-
-        # Motion threshold is defined as mode plus a multiplier of the standard
-        # deviation of the data-points below the mode
-        thresh = run_mode + n_std * left_std_run
-
-    elif stat_type == "parabolic_mode":
-        min_counts_per_bin = 5
-
-        n_bins = int(np.round(GVTD.shape[0] / min_counts_per_bin))
-
-        bin_size = GVTD.max() / n_bins
-
-        N, edges = np.histogram(
-            GVTD.values, bins=n_bins, range=(0, np.max(GVTD.values))
-        )
-
-        argmax = np.argmax(N)
-
-        centers = edges + bin_size.values / 2
-
-        centers = centers[:-1]
-
-        # Identify the adjacent points around the mode
-        x1, y1 = centers[argmax - 1], N[argmax - 1]
-        x2, y2 = centers[argmax], N[argmax]
-        x3, y3 = centers[argmax + 1], N[argmax + 1]
-
-        # Calculate the quadratic approximation for the mode
-        num = (x2**2 - x1**2) * (y2 - y3) - (x2**2 - x3**2) * (y2 - y1)
-        denom = (x2 - x1) * (y2 - y3) - (x2 - x3) * (y2 - y1)
-        run_mode = 0.5 * (num / denom)
-
-        # Find time points below the mode
-        points_below_mode = GVTD[GVTD < run_mode]
-
-        # Number of points below the mode
-        num_points_below_mode = points_below_mode.size
-
-        # RMS of points below the mode
-        rms_points_below_mode = np.sum((points_below_mode - run_mode) ** 2)
-
-        # Standard deviation of points below the mode
-        left_std_run = np.sqrt(rms_points_below_mode / num_points_below_mode)
-
-        # Motion threshold is defined as mode plus a multiplier of the standard
-        # deviation of the data-points below the mode
-        thresh = run_mode + n_std * left_std_run
-
-    elif stat_type == "median":
-        # Assuming gvtdTimeTrace is a numpy array
-        run_median = np.median(GVTD)
-
-        # Find time points below the median
-        points_below_median = GVTD[GVTD < run_median]
-
-        # Number of points below the median
-        num_points_below_median = points_below_median.size
-
-        # RMS of points below the median
-        rms_points_below_median = np.sum((points_below_median - run_median) ** 2)
-
-        # Standard deviation of points below the median
-        left_std_run = np.sqrt(rms_points_below_median / num_points_below_median)
-
-        # Motion threshold is defined as the median plus a multiplier of the standard
-        # deviation of the data-points below the median
-        thresh = run_median + n_std * left_std_run
-
-    elif stat_type == "mean":
-        # Assuming gvtdTimeTrace is a numpy array
-        run_mean = np.mean(GVTD)
-
-        # Find time points below the mean
-        points_below_mean = GVTD[GVTD < run_mean]
-
-        # Number of points below the mean
-        num_points_below_mean = points_below_mean.size
-
-        # RMS of points below the mean
-        rms_points_below_mean = np.sum((points_below_mean - run_mean) ** 2)
-
-        # Standard deviation of points below the mean
-        left_std_run = np.sqrt(rms_points_below_mean / num_points_below_mean)
-
-        # Motion threshold is defined as the mean plus a multiplier of the standard
-        # deviation of the data-points below the mean
-        thresh = run_mean + n_std * left_std_run
-
-    elif stat_type == "MAD":
-        # Calculate the MAD (median absolute deviation) with a scaling factor of 1
-        run_mad = median_abs_deviation(GVTD, scale=1)
-
-        # Motion threshold is defined as a multiplier of the MAD
-        thresh = n_std * run_mad
-
-    else:
-        raise ValueError(f"Unknown stat '{stat_type}'")
-
-    return thresh * units
-
+    return GVTD
 
 @cdc.validate_schemas
 def sci(
     amplitudes: NDTimeSeries,
     window_length: Quantity,
     sci_thresh: float,
-    cardiac_fmin: cdt.QFrequency = 0.5 * units.Hz,
-    cardiac_fmax: cdt.QFrequency = 2.5 * units.Hz,
+    cardiac_fmin: Annotated[Quantity, "[frequency]"] = 0.5 * units.Hz,
+    cardiac_fmax: Annotated[Quantity, "[frequency]"] = 2.5 * units.Hz,
 ):
     """Calculate the scalp-coupling index.
 
@@ -499,10 +375,10 @@ def sci(
 
 def _extract_cardiac(
     amplitudes: NDTimeSeries,
-    cardiac_fmin: cdt.QFrequency,
-    cardiac_fmax: cdt.QFrequency,
+    cardiac_fmin: Annotated[Quantity, "[frequency]"],
+    cardiac_fmax: Annotated[Quantity, "[frequency]"],
 ):
-    """Apply a bandpass or highpass filter to extract the cardiac component."""
+    """ Apply a bandpass or highpass filter to extract the cardiac component."""
 
     fs = sampling_rate(amplitudes)
     fny =  fs / 2
@@ -718,17 +594,17 @@ def id_motion_refine(ma_mask: cdt.NDTimeSeries, operator: str):
     """Refines motion artifact mask to simplify and quantify motion artifacts.
 
     Args:
-        ma_mask (:class:`NDTimeSeries`, (time, channel, *)): motion artifact mask as
-            generated by id_motion().
+        ma_mask :class:`NDTimeSeries`, (time, channel, *): motion artifact mask as
+        generated by id_motion().
 
         operator: operation to apply to the mask. Available operators:
 
-            - *by_channel*: collapses the mask along the amplitude/wavelength/chromo
-              dimension to provide a single motion artifact mask per channel (default)
-              over time
-            - *all*: collapses the mask along all dimensions to provide a single motion
-              artifact marker for all channels over time i.e. an artifact detected in
-              any channel masks all channels.
+            - "by_channel": collapses the mask along the amplitude/wavelength/chromo
+                dimension to provide a single motion artifact mask per channel (default)
+                over time
+            - "all": collapses the mask along all dimensions to provide a single motion
+                artifact marker for all channels over time i.e. an artifact detected in
+                any channel masks all channels.
 
     Returns:
         A tuple (ma_mask_new, ma_info), where `ma_mask_new` is the updated motion
@@ -802,23 +678,22 @@ def id_motion_refine(ma_mask: cdt.NDTimeSeries, operator: str):
 
 @cdc.validate_schemas
 def detect_outliers_std(
-    ts: cdt.NDTimeSeries, t_window: cdt.QTime, iqr_threshold=2
+    ts: cdt.NDTimeSeries, t_window: Annotated[Quantity, "[time]"], iqr_threshold=2
 ):
     """Detect outliers in fNIRSdata based on standard deviation of signal.
 
     Args:
         ts :class:`NDTimeSeries`, (time, channel, *): fNIRS timeseries data
-        t_window :class:`Quantity`: time window over which to calculate std. deviations
-        iqr_threshold: interquartile range threshold (detect outlier as any std.
-            deviation outside iqr_threshold * [25th percentile, 75th percentile])
+        t_window :class:`Quantity`: time window over which to calculate standard deviations
+        iqr_threshold: interquartile range threshold (detect outlier as any standard deviation outside 
+                                                      iqr_threshold * [25th percentile, 75th percentile])
 
     Returns:
-        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE
-        anytime an outlier is detected based on the standard deviation
+        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE anytime 
+        an outlier is detected based on the standard deviation
 
     References:
-        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m"
-        (:cite:t:`Jahani2018`)
+        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m" (:cite:t:`Jahani2017`)
     """
 
     ts = ts.pint.dequantify()
@@ -851,21 +726,20 @@ def detect_outliers_std(
 
 
 @cdc.validate_schemas
-def detect_outliers_grad(ts: cdt.NDTimeSeries, iqr_threshold: float = 1.5):
+def detect_outliers_grad(ts: cdt.NDTimeSeries, iqr_threshold=1.5):
     """Detect outliers in fNIRSdata based on gradient of signal.
 
     Args:
-        ts (:class:`NDTimeSeries`, (time, channel, *)): fNIRS timeseries data
-        iqr_threshold: interquartile range threshold (detect outlier as any gradient
-            outside iqr_threshold * [25th percentile, 75th percentile])
+        ts :class:`NDTimeSeries`, (time, channel, *): fNIRS timeseries data
+        iqr_threshold: interquartile range threshold (detect outlier as any gradient outside 
+                                                      iqr_threshold * [25th percentile, 75th percentile])
 
     Returns:
-        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE
-        anytime an outlier is detected
+        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE anytime 
+        an outlier is detected
 
     References:
-        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m"
-        (:cite:t:`Jahani2018`)
+        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m" (:cite:t:`Jahani2017`)
     """
 
     ts = ts.pint.dequantify()
@@ -905,27 +779,26 @@ def detect_outliers_grad(ts: cdt.NDTimeSeries, iqr_threshold: float = 1.5):
 @cdc.validate_schemas
 def detect_outliers(
     ts: cdt.NDTimeSeries,
-    t_window_std: cdt.QTime,
-    iqr_threshold_std: float = 2,
-    iqr_threshold_grad: float = 1.5,
+    t_window_std: Annotated[Quantity, "[time]"],
+    iqr_threshold_std : float =2,
+    iqr_threshold_grad : float =1.5,
 ):
     """Detect outliers in fNIRSdata based on standard deviation and gradient of signal.
 
     Args:
-        ts (:class:`NDTimeSeries`, (time, channel, *)): fNIRS timeseries data
-        t_window_std (:class:`Quantity`): time window over which to calculate std. devs.
-        iqr_threshold_grad: interquartile range threshold (detect outlier as any
-            gradient outside iqr_threshold * [25th percentile, 75th percentile])
-        iqr_threshold_std: interquartile range threshold (detect outlier as any standard
-            deviation outside iqr_threshold * [25th percentile, 75th percentile])
+        ts :class:`NDTimeSeries`, (time, channel, *): fNIRS timeseries data
+        t_window_std :class:`Quantity`: time window over which to calculate standard deviations
+        iqr_threshold_grad: interquartile range threshold (detect outlier as any gradient outside 
+                                                      iqr_threshold * [25th percentile, 75th percentile])
+        iqr_threshold_std: interquartile range threshold (detect outlier as any standard deviation outside 
+                                                      iqr_threshold * [25th percentile, 75th percentile])
 
     Returns:
-        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE
-        anytime an outlier is detected
+        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE anytime 
+        an outlier is detected
 
     References:
-        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m"
-        (:cite:t:`Jahani2018`)
+        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m" (:cite:t:`Jahani2017`)
     """
     mask_std = detect_outliers_std(ts, t_window_std, iqr_threshold_std)
     mask_grad = detect_outliers_grad(ts, iqr_threshold_grad)
@@ -1023,17 +896,15 @@ def detect_baselineshift(ts: cdt.NDTimeSeries, outlier_mask: cdt.NDTimeSeries):
     """Detect baselineshifts in fNIRSdata.
 
     Args:
-        ts (:class:`NDTimeSeries`, (time, channel, *)): fNIRS timeseries data
-        outlier_mask (:class:`NDTimeSeries`): mask containing FALSE anytime an outlier
-            is detected in signal
+        ts :class:`NDTimeSeries`, (time, channel, *): fNIRS timeseries data
+        outlier_mask :class:`NDTimeSeries`: mask containing FALSE anytime an outlier is detected in signal
 
     Returns:
-        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE
-        anytime a baselineshift or outlier is detected.
+        mask that is a DataArray containing TRUE anywhere the data is clean and FALSE anytime 
+        a baselineshift or outlier is detected
 
     References:
-        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m"
-        (:cite:t:`Jahani2018`)
+        Based on Homer3 v1.80.2 "hmrR_tInc_baselineshift_Ch_Nirs.m" (:cite:t:`Jahani2017`)
     """
     ts = ts.pint.dequantify()
 
@@ -1133,193 +1004,3 @@ def detect_baselineshift(ts: cdt.NDTimeSeries, outlier_mask: cdt.NDTimeSeries):
     shift_mask = shift_mask.isel(time=slice(pad_samples,-pad_samples))
 
     return shift_mask
-
-
-
-def stimulus_mask(df_stim : pd.DataFrame, mask : xr.DataArray) -> xr.DataArray:
-    """Create a mask which events overlap with periods flagged as tainted in mask.
-
-    Args:
-        df_stim: stimulus data frame
-        mask: signal quality mask. Must contain dimensions 'channel' and 'time'
-
-    Returns:
-        A boolean mask with dimensions "stim", "channel".
-        The stim dimension matches the stimulus dataframe. Stimuli are marked as
-        TAINTED when there is any TAINTED flag in the mask between onset and onset+
-        duration.
-    """
-    assert mask.ndim == 2
-    assert "channel" in mask.dims
-    assert "time" in mask.dims
-
-    result = np.zeros((len(df_stim), mask.sizes["channel"]), dtype=bool)
-
-    for i, r in df_stim.iterrows():
-        tmp = mask.sel(
-            time=(r["onset"] <= mask.time) & (mask.time < (r["onset"] + r["duration"]))
-        )
-        result[i,:] = (tmp == CLEAN).all("time")
-
-    return xr.DataArray(
-        result,
-        dims=["stim", "channel"],
-        coords=xrutils.coords_from_other(
-            mask,
-            dims=["channel"],
-            stim=("stim", df_stim.index),
-            trial_type=("stim", df_stim.trial_type),
-        ),
-    )
-
-def repair_amp(amp: xr.DataArray, median_len=3, interp_nan=True, **kwargs):
-    """Replace nonpositive amp values and optionally fill NaNs.
-
-    TODO: Optimize handling of sequential nonpositive values.
-
-    Args:
-        amp: Amplitude data
-        median_len: Window size for the median filter
-        interp_nan: If True, interpolate NaNs in the data
-        **kwargs: Additional arguments for xarray interpolate_na function, such
-            as method = "linear" (default), method = "nearest", etc. See xarray
-            documentation for more details.
-    """
-    pad_width = median_len // 2
-
-    # Fill NaNs
-    if interp_nan:
-        amp = amp.pint.dequantify()
-        amp = amp.interpolate_na(dim="time", **kwargs)
-        amp = amp.pint.quantify()
-
-    # Replace nonpositive values with a small value
-    unit = amp.pint.units
-    amp = amp.where(amp>0, 1e-18 * unit)
-
-    if median_len > 1:
-        # Pad the data before applying the median filter
-        padded_amp = amp.pad(time=(pad_width, pad_width), mode="edge")
-
-        # Apply median filter
-        filtered_padded_amp = (
-            padded_amp.rolling(time=median_len, center=True)
-            .reduce(np.median)
-        )
-        # Trim the padding after applying the filter
-        return filtered_padded_amp.isel(time=slice(pad_width, -pad_width))
-
-    return amp
-
-
-
-def measurement_variance(
-    ts: xr.DataArray,
-    list_bad_channels: list = None,
-    bad_rel_var: float = 1e6,
-    bad_abs_var: float = None,
-    calc_covariance: bool = False,
-) -> xr.DataArray:
-    """Estimate measurement variance or covariance from an fNIRS time series.
-
-    Can be used as a proxy for measurement noise, in this case it should be applied in OD or CONC domain.
-    Ideally, the input is the residual of a time series after GLM fitting, but raw data can also be used.
-    This function can be used as a helper function for weighted mean subtraction or for image recon
-    regularization, in which bad channels (noisy, with high variance) are downweighted.
-
-    Args:
-    ts: Input time series with dimensions (time, channel, chromo/wavelength).
-    list_bad_channels: List of channel names (e.g. ["S2D4", "S2D10"]) to be treated as bad.
-    bad_rel_var: Multiplier for worst-case variance for bad channels if `bad_abs_var` is not provided.
-    bad_abs_var: Absolute variance to assign to bad channels. Overrides `bad_rel_var` if provided.
-    calc_covariance: If True, returns a 3D covariance matrix: (other_dim, channel, channel).
-        If False, returns a 2D variance array: (chromo, channel).
-
-    Returns:
-    xr.DataArray: Variance array (shape: channel, chromo/wavelength) or covariance 
-        array (shape: chromo/wavelength, channel1, channel2)
-
-    Initial Contributors:
-        Josef Cutler | cutler@tu-berlin.de | 2025
-        Alexander von Lühmann | vonluehmann@tu-berlin.de | 2025
-    """
-    if list_bad_channels is None:
-        list_bad_channels = []
-
-    # Identify other dimension (chromo/wavelength)
-    other_dim = xrutils.other_dim(ts, "time", "channel")
-    other_dim_values = ts[other_dim].values
-
-    # Compute variance
-    var = ts.var(dim="time")
-
-    # Create bad channel mask
-    zero_var_mask = (var == 0)
-    bad_channels_from_zero_var = set()
-    if zero_var_mask.any():
-        for channel in ts.channel.values:
-            if zero_var_mask.sel(channel=channel).any():
-                bad_channels_from_zero_var.add(channel)
-
-    # Combine with explicitly passed bad channels
-    all_bad_channels = bad_channels_from_zero_var.union(set(list_bad_channels))
-    valid_bad_channels = [ch for ch in all_bad_channels if ch in ts.channel.values]
-
-    # Create mask for entire bad channels (across all other_dim coordinates)
-    bad_channel_mask = ts.channel.isin(valid_bad_channels)
-
-    # Compute bad variance fill value
-    good_var = var.where(~bad_channel_mask)
-    max_good_var = good_var.max().item() if good_var.notnull().any() else 1.0
-    var_fill_value = bad_abs_var if bad_abs_var is not None else bad_rel_var * max_good_var
-
-    # Replace variance of bad channels
-    var = var.where(~bad_channel_mask, other=var_fill_value)
-
-    if not calc_covariance:
-        return var
-
-    # Initialize 3D covariance array, shape (other_dim, channel, channel)
-    channels = ts.channel.values
-    n_other_dim, n_channels = len(other_dim_values), len(channels)
-    cov_matrix_3d = np.zeros((n_other_dim, n_channels, n_channels))
-    bad_ch_indices = np.array([ch in valid_bad_channels for ch in channels])
-
-    # Compute covariance for each other_dim coordinate
-    for i, other_val in enumerate(other_dim_values):
-        data_slice = ts.sel({other_dim: other_val})
-        data_matrix = data_slice.values  # Shape: (n_channels, n_time)
-        cov_matrix_2d = np.cov(data_matrix, ddof=1)  # Shape: (n_channels, n_channels)
-
-        # Replace covariance of bad channels
-        if valid_bad_channels:
-            # Get max off-diagonal covariance from good channels
-            good_cov_matrix = cov_matrix_2d.copy()
-            good_cov_matrix[bad_ch_indices, :] = np.nan
-            good_cov_matrix[:, bad_ch_indices] = np.nan
-            np.fill_diagonal(good_cov_matrix, np.nan)
-            max_good_cov = np.nanmax(np.abs(good_cov_matrix)) if not np.isnan(good_cov_matrix).all() else 0
-
-            # Replace covariance of bad channels
-            cov_fill_value = var_fill_value if bad_abs_var is not None else bad_rel_var * max_good_cov
-            cov_matrix_2d[bad_ch_indices, :] = cov_fill_value
-            cov_matrix_2d[:, bad_ch_indices] = cov_fill_value
-            bad_diag_mask = np.diag(bad_ch_indices)
-            cov_matrix_2d[bad_diag_mask] = var_fill_value
-
-        cov_matrix_3d[i] = cov_matrix_2d
-
-    # Create coordinate arrays
-    coords = {
-        other_dim: other_dim_values,
-        "channel1": channels,
-        "channel2": channels,
-    }
-
-    covar = xr.DataArray(
-        cov_matrix_3d,
-        dims=(other_dim, "channel1", "channel2"),
-        coords=coords,
-    )
-
-    return covar

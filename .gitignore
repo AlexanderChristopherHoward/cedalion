@@ -171,7 +171,6 @@ docs/examples/*/*.ipynb
 
 # API documentation from sphinx-apidoc
 docs/api/*
-_autosummary*/
 
 # vscode settings
 .vscode/

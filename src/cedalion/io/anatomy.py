@@ -1,14 +1,8 @@
-"""Functions for reading and processing anatomical data."""
-
+import nibabel
+import xarray as xr
 import os
 from typing import Dict, Tuple
-from pathlib import Path
-
-import nibabel
 import numpy as np
-import pandas as pd
-import xarray as xr
-
 from cedalion.dataclasses import affine_transform_from_numpy
 
 # FIXME
@@ -65,10 +59,8 @@ def read_segmentation_masks(
 
     Returns:
         Tuple[xr.DataArray, np.ndarray]:
-            - masks (xr.DataArray): Concatenated segmentation masks with a new
-              dimension `segmentation_type`.
-            - affine (np.ndarray): Affine transformation matrix associated with the
-              NIFTI files.
+            - masks (xr.DataArray): Concatenated segmentation masks with a new dimension `segmentation_type`.
+            - affine (np.ndarray): Affine transformation matrix associated with the NIFTI files.
     """
     mask_ids = {seg_type: i + 1 for i, seg_type in enumerate(mask_files.keys())}
     masks = []
@@ -151,24 +143,3 @@ def cell_coordinates(mask, affine, units="mm"):
     transformed = transformed.pint.quantify()
 
     return transformed
-
-
-
-def read_parcellations(parcel_file: str | Path) -> pd.DataFrame:
-    """Read parcellation labels from a json file.
-
-    Args:
-        parcel_file: The parcels file name
-
-    Returns:
-        pd.DataFrame: Contains vertices' labels, their appropriate colors
-    """
-    parcels = pd.read_json(parcel_file)
-
-    parcels = parcels.explode("Vertices")
-    parcels["Vertices"] = parcels["Vertices"].astype(int)
-    parcels = parcels.sort_values("Vertices")
-
-    parcels["Label"] = parcels["Label"].apply(lambda x: "_".join(x.split(" ")) + "H")
-
-    return parcels

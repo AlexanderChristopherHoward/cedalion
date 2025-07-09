@@ -44,14 +44,6 @@ Machine Learning and Data Driven Methods
 
    examples/machine_learning/*
 
-Physiology
------------------------
-
-.. nbgallery::
-   :glob:
-
-   examples/physio/*
-
 Data Augmentation
 -----------------------
 

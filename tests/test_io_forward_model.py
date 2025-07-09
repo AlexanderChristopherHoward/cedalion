@@ -1,7 +1,7 @@
-import os
-import tempfile
+import os, tempfile
 import numpy as np
 import xarray as xr
+import cedalion
 import cedalion.io as cio
 
 def create_dummy_Adot():

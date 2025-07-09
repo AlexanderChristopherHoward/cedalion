@@ -1,4 +1,4 @@
-"""Data classes used throughout cedalion."""
+"""Common classes."""
 
 # FIXME for easier access classes are pulled from the sub-modules into this scope.
 # Over time this may get crowded.
